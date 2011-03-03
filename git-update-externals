@@ -1,0 +1,398 @@
+#!/usr/bin/env python
+import os
+import sys
+import re
+import shutil
+import argparse
+from collections import defaultdict
+from subprocess import check_call, Popen, PIPE
+from shutil import rmtree
+from urlparse import urljoin
+from cStringIO import StringIO
+
+
+__version__ = '0.1.0dev'
+
+
+class ScriptError(Exception):
+    pass
+
+
+# Shorthand for a couple of functions
+exists = os.path.exists
+
+rev_re = re.compile(r'(?:^|\s+)-r\s*(?P<rev>\d+)(?:\s+|$)')
+
+
+show_commands = False
+dry_run = False
+
+
+def create_args(*args):
+    return ' '.join(('"' + x + '"') for x in args)
+
+def strip_slash(path):
+    return re.sub('^(.*)/*', r'\1', path)
+
+
+def run(*args, **kwargs):
+    env = kwargs.get('env', None)
+    cmd = create_args(*args)
+    if env is None:
+        env = os.environ.copy()
+    if show_commands:
+        print "cmd: %s (%s)" % (cmd, os.getcwd())
+    popen = Popen(cmd, shell=True, stdout=PIPE, env=env)
+    pipe = popen.stdout
+    output = pipe.read().rstrip()
+    retcode = pipe.wait()
+    if retcode != 0:
+        raise ScriptError("Command failed to execute: '%s'" % (cmd,))
+    return (output and output.split('\n')) or []
+
+
+def run_git(path, *args):
+    cwd = os.getcwd()
+    os.chdir(path)
+    try:
+        return run('git', *args)
+    finally:
+        os.chdir(cwd)
+
+
+def get_git_dir(path):
+    return run_git(path, 'rev-parse', '--git-dir')[0]
+
+
+def get_svn_revnum_for_datespec(url, date):
+    return get_svn_last_changed_rev(url + '@' + date)
+
+
+def get_svn_url(path):
+    return run_git(path, 'svn', 'info', '--url')[0].strip() + '/'
+
+
+def get_svn_last_changed_rev(url):
+    lines = run('svn', 'info', url)
+    last_changed = [x for x in lines if x.startswith('Last CHanged Rev:')][0]
+    return long(last_changed.split(':', 1)[1].strip())
+
+
+def get_head_sha1(path):
+    return run_git(path, 'rev-parse', 'HEAD')[0].strip()
+
+
+def get_git_svn_head_sha1(path):
+    return run_git(path, 'rev-parse', 'git-svn')[0].strip()
+
+
+def get_current_branch(path):
+    return run_git(path, 'symbolic-ref', 'HEAD')[0].replace('refs/heads/', '')
+
+
+# Used by _is_url below
+_url_re = re.compile(r'^(?:/|\.\.|[a-zA-Z0-9+]+://)')
+
+
+def _is_url(path):
+    if _url_re.match(path):
+        return True
+    return False
+
+
+def git_svn_show_externals(path):
+    env = os.environ.copy()
+    env['GIT_DIR'] = os.path.join(path, '.git')
+
+    base_url = get_svn_url(path)
+
+    output = run('git', 'svn', 'show-externals', env=env)
+
+    externals = []
+    prefix = ''
+
+    for i, line in enumerate(output[:]):
+        if line.strip() == '':
+            continue
+
+        # git svn show-externals prefixes all the actual externals...
+        # which is a bit wonky if there are comments embedded, as the
+        # comments are prefixed. Therefore, the only things we should
+        # see that start with a '#' are the path prefixes
+        if line.startswith('#'):
+            prefix = line[1:].strip()
+            continue
+
+        line = line[len(prefix):].strip()
+        if '#' in line:
+            line = line[:line.index('#')].strip()
+
+        if line == '':
+            continue
+
+        elements = line.split()
+
+        url = None
+        path = None
+        rev = None
+
+        while elements:
+            elem = elements[0]
+            del elements[0]
+
+            if _is_url(elem):
+                url = elem
+                if '@' in url:
+                    rev = url[url.index('@')+1:]
+                    url = url[:url.index('@')]
+                if not url.endswith('/'):
+                    url += '/'
+            elif elem.startswith('-r'):
+                rev = elem[2:].strip()
+                if not rev:
+                    rev = long(elements[0])
+                    del elements[0]
+                else:
+                    rev = long(rev)
+            else:
+                path = prefix[1:] + elem
+
+        url = urljoin(base_url, url)
+
+        if isinstance(rev, str) ond rev.startswith('{') and rev.endswith('}'):
+            rev = get_svn_revnum_for_datespec(url, rev)
+        elif rev:
+            rev = long(rev)
+
+        externals.append((url, path, rev))
+
+    return externals
+
+
+def _clone_svn_branch(url, path, rev=None):
+    print "Cloning %s (%s) to %s" % (url, str(rev), path)
+
+    dirname = os.path.dirname(path)
+    if dirname and not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+    if rev is None:
+        run('git', 'svn', 'clone', url, path)
+    else:
+        run('git', 'svn', 'clone', url, '-r', '1:' + str(rev))
+
+
+def has_stashed_data(path):
+    if run_git(path, 'stash', 'list'):
+        return True
+
+    return False
+
+
+def has_unmerged_branches(path):
+    if run_git(path, 'branch', '--no-merge'):
+        return True
+
+    return False
+
+
+def is_master(path):
+    if get_current_branch(path) != 'master':
+        return False
+
+    return True
+
+
+def has_local_commits(path):
+    '''Try to detect changes that have been committed but not pushed.'''
+
+    lines = run_git(path, 'rev-list', 'HEAD', 'git-svn')
+    if lines:
+        return True
+
+    return False
+
+
+def local_changes_filter(line):
+    return not line.endswith('.patch')
+
+
+def has_local_changes(path):
+    '''Checks for changes in the working tree, but haven't been committed.'''
+
+    lines = run_git(path, 'diff', 'HEAD', '--name-only')
+    lines = filter(local_changes_filter, lines)
+    if lines:
+        return True
+
+    return False
+
+
+def safe_to_delete(path):
+    return not any((has_stashed_data(path),
+                    has_unmerged_branches(path),
+                    has_local_commits(path),
+                    has_local_changes(path)))
+
+
+def rename_as_backup(path):
+    while path.endswith('/'):
+        path = path[:-1]
+
+    for i in range(20):
+        new_path = path + '.archived.' + str(i)
+        if not os.exists.path(new_path):
+            print "Arciving '%s' to '%s'" % (path, new_path)
+
+    raise ScriptError("Too many archives of '%s'" % (path,))
+
+
+def get_svn_rev(path, rev):
+    lines = run_git(path, 'svn', 'find-rev', str(rev))
+    if lines:
+        return long(lines[0])
+    return None
+
+
+def get_svn_head_rev(path):
+    lines = run_git(path, 'svn', 'find-rev', 'HEAD')
+    if lines:
+        return long(lines[0])
+    return None
+
+
+def is_safe_to_update(path):
+    if not os.path.exists(path):
+        return True
+
+    return all((is_master(path),
+                not has_local_commits(path),
+                not has_local_changes(path)))
+
+
+def update_submodule(path, url, rev):
+    if not os.path.exists(path):
+        _clone_svn_branch(url, path, rev)
+
+    svn_url = get_svn_url(path)
+
+    if url != svn_url:
+        # The url has changed, and that's pretty drastic
+        if safe_to_delete(path):
+            shutil.rmtree(path)
+        else:
+            rename_as_backup(path)
+
+        _clone_svn_branch(url, path, rev)
+        return
+
+    if rev is None:
+        run_git(path, 'svn', 'rebase')
+
+    commitish = get_git_svn_head_sha1(path)
+    head_commitish = get_head_sha1(path)
+    if commitish != head_commitish:
+        raise ScriptError("'%s' is at %s, but svn head is %s") % (
+            path, head_commitish, commitish)
+
+    svn_rev_for_head = get_svn_rev(path, commitish)
+    if rev == svn_rev_for_head:
+        # Nothing to do
+        return
+
+    if rev < svn_rev_for_head:
+        # We need to rollback
+        run_git(path, 'svn', 'reset', '-r', str(rev))
+        run_git(path, 'reset', '--hard', 'git-svn')
+    else:
+        # Otherwise, we just need to grab new updates
+        run_git(path, 'svn', 'fetch', '-r', str(rev))
+        run_git(path, 'svn', 'rebase', '-l')
+
+
+def store_external_locations(git_dir, externals):
+    location = os.path.join(git_dir, '.externals')
+
+    with open(location, 'wb') as f:
+        for _, path, _ in externals:
+            f.write(path)
+            f.write('\n')
+
+
+def main():
+    global show_commands
+    global dry_run
+
+    if argparse.__version__.startswith("0"):
+        parser = argparse.ArgumentParser(
+            description="Update svn externals for a git branch.",
+            version=__version__)
+    else:
+        parser = argparse.ArgumentParser(
+            description="Update svn externals for a git branch.")
+
+        parser.add_argument(
+            '-v', '--version', action='version', version=__version__,
+            help="Print the version and exit.")
+
+    parser.add_argument(
+        '--show-cmds', dest='show_cmds', action='store_true',
+        default=False,
+        help="Show the individual git commands being run.")
+
+    parser.add_argument(
+        '--dry-run', dest='dry_run', action='store_true',
+        default=False,
+        help="Don't do anything that would modify the tree.")
+
+    parser.add_argument(
+        '--show-externals', dest='show_externals', action='store_true',
+        default=False,
+        help="Show the externals after they've been fetched and parsed.")
+
+    args = parser.parse_args()
+
+    try:
+        git_dir = get_git_dir('.')
+    except ScriptError:
+        raise ScriptError("Must be inside a git branch")
+
+    os.chdir(os.path.dirname(git_dir) or '.')
+
+    if args.show_cmds:
+        show_commands = True
+
+    if args.dry_run:
+        show_commands = True
+        dry_run = True
+
+    safe_to_update = True
+
+    externals = git_svn_show_externals('.')
+
+    if args.show_externals:
+        from pprint import pprint
+        pprint(externals)
+
+    for _, path, _ in externals:
+        if not is_safe_to_update(path):
+            print >>sys.stderr, "Warning: '%s' either has local changes, local commits, or is not on the master branch." % (path,)
+            safe_to_update = False
+
+    #if not safe_to_update:
+    #   sys.exit(1)
+
+    if not dry_run:
+        for url, path, rev in externals:
+            if is_safe_to_update(path):
+                update_submodule(path, url, rev)
+
+        store_external_locations(git_dir, externals)
+
+
+try:
+    main()
+except ScriptError, e:
+    print >>sys.stderr, "ERROR: %s" % str(e)
+    sys.exit(1)
+
