@@ -9,7 +9,7 @@ class ScriptError(Exception):
     pass
 
 
-show_commands = True
+show_commands = False
 
 
 def get_top_level():
