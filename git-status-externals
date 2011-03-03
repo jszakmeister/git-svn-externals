@@ -87,6 +87,8 @@ branches.remove(top_level)
 branches = [top_level] + sorted(branches)
 
 status_re = re.compile(r'(?P<status>..) (?P<path>.*)')
+header_re = re.compile(
+    r'## (?P<lbranch>[^.]*)(?:\.\.\.(?P<rbranch>[^ ]*))?(?: \[(?P<ahead>.+ .+)\])?')
 
 for branch in branches:
     lines = run_git(branch, 'status', '-sb')
@@ -94,16 +96,34 @@ for branch in branches:
         continue
 
     for l in lines:
-        m = status_re.match(l)
+        m = header_re.match(l)
         if m:
-            path = compute_rel(cwd, os.path.join(branch, m.group('path')))
-
-            if m.group('status') == '##':
-                status = m.group('status')
-                path = '\x1b[33;32m%s\x1b[m' % path
+            lbranch = compute_rel(cwd,
+                                  os.path.join(branch, m.group('lbranch')))
+            lbranch = "\x1b[33;32m%s\x1b[m" % lbranch
+            if m.group('rbranch'):
+                rbranch = "...\x1b[33;31m%s\x1b[m" % m.group('rbranch')
             else:
-                status = '\x1b[33;31m%s\x1b[m' % m.group('status')
+                rbranch = ''
 
-            print '%s %s' % (status, path)
+            if m.group('ahead'):
+                ahead = m.group('ahead').split(' ')
+                if int(ahead[1]) >= 0:
+                    color = '32'
+                else:
+                    color = '31'
+                ahead = ' [%s \x1b[33;%sm%s\x1b[m]' % (
+                    ahead[0], color, ahead[1])
+            else:
+                ahead = ''
+
+            print '## %s%s%s' % ( lbranch, rbranch, ahead)
         else:
-            print l
+            m = status_re.match(l)
+            if not m:
+                print l
+                continue
+
+            status = '\x1b[33;31m%s\x1b[m' % m.group('status')
+            path = compute_rel(cwd, os.path.join(branch, m.group('path')))
+            print '%s %s' % (status, path)
