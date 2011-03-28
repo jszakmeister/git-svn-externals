@@ -98,8 +98,11 @@ for branch in branches:
     for l in lines:
         m = header_re.match(l)
         if m:
-            lbranch = compute_rel(cwd,
-                                  os.path.join(branch, m.group('lbranch')))
+            if cwd.startswith(branch):
+                lbranch = m.group('lbranch')
+            else:
+                lbranch = compute_rel(cwd,
+                                      os.path.join(branch, m.group('lbranch')))
             lbranch = "\x1b[33;32m%s\x1b[m" % lbranch
             if m.group('rbranch'):
                 rbranch = "...\x1b[33;31m%s\x1b[m" % m.group('rbranch')
@@ -125,5 +128,8 @@ for branch in branches:
                 continue
 
             status = '\x1b[33;31m%s\x1b[m' % m.group('status')
-            path = compute_rel(cwd, os.path.join(branch, m.group('path')))
+            if cwd.startswith(branch):
+                path = m.group('path')
+            else:
+                path = compute_rel(cwd, os.path.join(branch, m.group('path')))
             print '%s %s' % (status, path)
