@@ -92,7 +92,7 @@ header_re = re.compile(
 
 for branch in branches:
     lines = run_git(branch, 'status', '-sb')
-    if len(lines) == 1:
+    if len(lines) == 1 and lines[0] == '## master':
         continue
 
     for l in lines:
